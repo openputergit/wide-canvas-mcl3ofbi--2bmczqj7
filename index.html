@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DJ Studio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+    <style>
+        .waveform-container {
+            background: #2a2a2a;
+            border-radius: 8px;
+            height: 100px;
+        }
+        #videoElement {
+            transform: scaleX(-1);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <!-- Header -->
+    <header class="bg-gray-800 p-4">
+        <div class="container mx-auto">
+            <h1 class="text-2xl font-bold">DJ Studio</h1>
+            <p class="text-gray-400">Real-time collaborative DJ experience</p>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="container mx-auto p-4">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <!-- Left Column - Track Search and Control -->
+            <div class="space-y-6">
+                <!-- Search Section -->
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <div class="flex gap-2">
+                        <input type="text" id="searchInput" placeholder="Search tracks..." 
+                               class="flex-1 bg-gray-700 text-white p-2 rounded-lg">
+                        <button onclick="searchTracks()" 
+                                class="bg-blue-600 px-4 py-2 rounded-lg hover:bg-blue-700">
+                            Search
+                        </button>
+                    </div>
+                    <div id="searchResults" class="mt-4 space-y-2"></div>
+                </div>
+
+                <!-- Track Details -->
+                <div id="trackDetails" class="bg-gray-800 p-4 rounded-lg hidden">
+                    <h2 id="trackTitle" class="text-xl font-bold"></h2>
+                    <p id="trackArtist" class="text-gray-400"></p>
+                    <div class="flex gap-4 mt-2">
+                        <span id="trackBPM"></span>
+                        <span id="trackDuration"></span>
+                    </div>
+                    <div class="waveform-container mt-4" id="waveform"></div>
+                    <div class="flex justify-between mt-4">
+                        <button id="playButton" class="bg-green-600 px-4 py-2 rounded-lg hover:bg-green-700">
+                            <i class="bi bi-play-fill"></i> Play
+                        </button>
+                        <button id="stopButton" class="bg-red-600 px-4 py-2 rounded-lg hover:bg-red-700">
+                            <i class="bi bi-stop-fill"></i> Stop
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column - Gesture Control -->
+            <div class="space-y-6">
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <h2 class="text-xl font-bold mb-4">Gesture Control</h2>
+                    <video id="videoElement" class="w-full rounded-lg" playsinline></video>
+                    <canvas id="gestureCanvas" class="w-full rounded-lg mt-4"></canvas>
+                    <div id="gestureStatus" class="mt-4 text-center"></div>
+                </div>
+
+                <!-- Connected Users -->
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <h2 class="text-xl font-bold mb-4">Connected Users</h2>
+                    <div id="connectedUsers" class="space-y-2"></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // Socket.IO Connection
+        const socket = io('http://localhost:5000');
+        
+        socket.on('connect', () => {
+            console.log('Connected to server');
+            updateStatus('Connected to server');
+        });
+
+        socket.on('gesture_update', (data) => {
+            updateGestureDisplay(data);
+        });
+
+        // Track Search
+        async function searchTracks() {
+            const query = document.getElementById('searchInput').value;
+            try {
+                const response = await fetch(`http://localhost:5000/api/tracks/search?q=${encodeURIComponent(query)}`);
+                const tracks = await response.json();
+                displaySearchResults(tracks);
+            } catch (error) {
+                console.error('Error searching tracks:', error);
+                updateStatus('Error searching tracks');
+            }
+        }
+
+        function displaySearchResults(tracks) {
+            const resultsDiv = document.getElementById('searchResults');
+            resultsDiv.innerHTML = '';
+            tracks.forEach(track => {
+                const trackElement = document.createElement('div');
+                trackElement.className = 'bg-gray-700 p-2 rounded-lg cursor-pointer hover:bg-gray-600';
+                trackElement.innerHTML = `
+                    <div class="font-bold">${track.title}</div>
+                    <div class="text-sm text-gray-400">${track.artist}</div>
+                `;
+                trackElement.onclick = () => loadTrackDetails(track.id);
+                resultsDiv.appendChild(trackElement);
+            });
+        }
+
+        async function loadTrackDetails(trackId) {
+            try {
+                const response = await fetch(`http://localhost:5000/api/tracks/${trackId}`);
+                const track = await response.json();
+                displayTrackDetails(track);
+            } catch (error) {
+                console.error('Error loading track details:', error);
+                updateStatus('Error loading track details');
+            }
+        }
+
+        function displayTrackDetails(track) {
+            document.getElementById('trackDetails').classList.remove('hidden');
+            document.getElementById('trackTitle').textContent = track.title;
+            document.getElementById('trackArtist').textContent = track.artist;
+            document.getElementById('trackBPM').textContent = `${track.bpm} BPM`;
+            document.getElementById('trackDuration').textContent = formatDuration(track.duration);
+            // TODO: Implement waveform visualization
+        }
+
+        // Gesture Detection
+        let hands;
+        let camera;
+        let lastGestureData = null;
+
+        async function setupGestureDetection() {
+            const videoElement = document.getElementById('videoElement');
+            const canvasElement = document.getElementById('gestureCanvas');
+            const canvasCtx = canvasElement.getContext('2d');
+
+            hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(results => {
+                canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                if (results.multiHandLandmarks) {
+                    for (const landmarks of results.multiHandLandmarks) {
+                        const gestureData = processHandGestures(landmarks);
+                        if (gestureData) {
+                            socket.emit('gesture_data', gestureData);
+                        }
+                    }
+                }
+            });
+
+            camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+
+            camera.start();
+        }
+
+        function processHandGestures(landmarks) {
+            // Simple gesture processing - can be expanded
+            const palmCenter = landmarks[0];
+            const rotation = calculateRotation(landmarks);
+            const pinch = calculatePinch(landmarks);
+
+            return {
+                hand: 'right',
+                rotation,
+                pinch,
+                timestamp: Date.now()
+            };
+        }
+
+        function calculateRotation(landmarks) {
+            // Simplified rotation calculation
+            const wrist = landmarks[0];
+            const middle = landmarks[9];
+            return Math.atan2(middle.y - wrist.y, middle.x - wrist.x) * (180 / Math.PI);
+        }
+
+        function calculatePinch(landmarks) {
+            // Simple pinch detection between thumb and index finger
+            const thumb = landmarks[4];
+            const index = landmarks[8];
+            const distance = Math.sqrt(
+                Math.pow(thumb.x - index.x, 2) + 
+                Math.pow(thumb.y - index.y, 2)
+            );
+            return distance < 0.1;
+        }
+
+        // Utility Functions
+        function updateStatus(message) {
+            document.getElementById('gestureStatus').textContent = message;
+        }
+
+        function formatDuration(seconds) {
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+            return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+        }
+
+        function updateGestureDisplay(data) {
+            const usersDiv = document.getElementById('connectedUsers');
+            const userElement = document.createElement('div');
+            userElement.className = 'bg-gray-700 p-2 rounded-lg';
+            userElement.innerHTML = `
+                <div>User Gesture Update</div>
+                <div class="text-sm text-gray-400">
+                    Rotation: ${Math.round(data.rotation)}°
+                    Pinch: ${data.pinch ? 'Yes' : 'No'}
+                </div>
+            `;
+            usersDiv.appendChild(userElement);
+            
+            // Remove old updates
+            if (usersDiv.children.length > 5) {
+                usersDiv.removeChild(usersDiv.firstChild);
+            }
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            setupGestureDetection();
+        });
+    </script>
+<script>document.body.addEventListener('wheel', e => { if (!e.ctrlKey) return; e.preventDefault(); return }, { passive: false })</script>
+	</body>
+</html>
